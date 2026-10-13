@@ -11,8 +11,8 @@
 
 ## Kết quả cuối
 
-- `dataset_version` của bạn: `<điền>`  (phải khớp `report/evidence/run_summary.json`)
-- Số khung hình train / val / test của bạn: `<điền>`
+- `dataset_version` của bạn: `ce01decd323e`  (phải khớp `report/evidence/run_summary.json`)
+- Số khung hình train / val / test của bạn: 658 train / 214 val / 147 test (tổng 1019 khung hình)
 - `report/verify.txt`: tạo bằng `python3 scripts/check_submission.py --save-verify` (phải có `27/27 checks passed`).
 - Ảnh chụp trong `report/screenshots/`: `airflow_graph.png`, `minio_lake.png`, `metabase_dashboard.png`, và ảnh bài tập sập/chạy lại (log task đỏ thấy trip của bạn).
 
@@ -115,17 +115,47 @@ Khung hình **đen** và khung hình **tối** khác nhau thế nào, pipeline x
 ### Câu 6
 Dựa vào `leakage.json`: chia theo khung hình làm bao nhiêu trip bị chia cắt, so với chia theo trip? Vì sao điều này làm điểm kiểm thử đẹp một cách giả tạo?
 
-(trả lời ở đây)
+**Số liệu thực tế từ thí nghiệm `report/evidence/leakage.json`:**
+- Tổng số khung hình sạch đủ điều kiện sử dụng là **1019 khung hình**, thuộc **26 trip**.
+- **Khi chia ngẫu nhiên THEO KHUNG HÌNH (per-frame 70/15/15)**: Có tới **26/26 trip bị chia cắt** (nằm ở nhiều hơn 1 split), và **26/26 trip có khung hình xuất hiện ở cả train lẫn test** (tỉ lệ rò rỉ dữ liệu là 100%).
+- **Khi chia THEO TRIP (Gold của pipeline)**: Có chính xác **0 trip bị chia cắt** (`per_trip_split_trips_straddling = 0`). Mỗi trip chỉ thuộc duy nhất về một split.
+
+**Vì sao chia theo khung hình làm điểm kiểm thử đẹp một cách giả tạo (Data Leakage):**
+Dữ liệu video xe tự lái có tính tương quan chuỗi thời gian cực cao (temporal correlation). Ở tần số lấy mẫu 2 fps, hai khung hình liên tiếp cách nhau chỉ 0.5 giây gần như có cùng góc nhìn, điều kiện ánh sáng, cung đường, và các phương tiện xung quanh. Nếu chia theo khung hình, mô hình AI đã học khung hình ở giây $t$ trong tập train và đi "thi" ở khung hình tại giây $t+0.5$ trong tập test. Bản chất mô hình chỉ đang học vẹt bối cảnh quen thuộc chứ không học được khả năng khái quát hóa (generalization). Điểm kiểm thử (accuracy/mAP/loss) sẽ cao chót vót trong phòng lab, nhưng khi đem xe chạy thực tế trên cung đường mới lạ (unseen scenes), mô hình sẽ phán đoán sai lệch nghiêm trọng.
 
 ### Câu 7
 Vì sao `dataset_version` là **băm nội dung** chứ không phải ngày giờ hay số đếm? Hai lần chạy liên tiếp cho kết quả gì? Vì sao `dataset_version` của bạn **khác** bạn bè dù cùng dữ liệu (liên hệ MSSV)?
 
-(trả lời ở đây)
+1. **Vì sao `dataset_version` là băm nội dung (Content Hash)**:
+   Nếu dùng ngày giờ chạy (timestamp) hoặc số đếm tăng dần (auto-increment), mỗi lần chạy lại pipeline trên cùng một tập dữ liệu sẽ sinh ra một version mới khác nhau, vi phạm tính **Tái lập (Reproducibility)** trong MLOps. Sử dụng băm nội dung (content-addressable) bảo đảm nguyên tắc tất định: hễ cùng dữ liệu đầu vào và cùng logic xử lý thì luôn cho ra một mã băm duy nhất, giúp kiểm tra tính toàn vẹn và tái sử dụng cache.
+2. **Kết quả hai lần chạy liên tiếp**:
+   Hai lần chạy liên tiếp cho ra cùng một `dataset_version = ce01decd323e` duy nhất, không phụ thuộc vào thời điểm thực thi.
+3. **Vì sao `dataset_version` của bạn khác bạn bè dù cùng dữ liệu**:
+   Trong dbt model `gold_dataset_frames.sql`, các trip được trộn thứ tự ngẫu nhiên bằng hàm băm có pha muối (salt) là MSSV: `order by md5(trip_id || '{{ env_var("LAB_STUDENT_ID") }}')`. Với `LAB_STUDENT_ID=2A202602971`, thứ tự trip được sắp xếp riêng biệt, dẫn tới việc phân chia các trip vào train, val, test của tôi khác với các bạn khác. Nội dung tập dữ liệu xuất ra khác nhau làm cho mã băm của `manifest.json` khác nhau, tạo ra `dataset_version` độc bản cho từng sinh viên.
 
 ### Câu 8
 Đọc phần `lineage` trong `manifest.json` của dataset bạn. Trả lời "dataset này được tạo từ dữ liệu nào?" bằng chính nội dung đó. Nếu một người hỏi 3 tháng sau, thông tin nào giúp tái tạo lại đúng dataset này?
 
-(trả lời ở đây)
+**1. Nguồn gốc dữ liệu theo phần `lineage` trong `manifest.json` (`dataset_version: ce01decd323e`):**
+Dataset này được tổng hợp từ:
+- **Hai video gốc đầu vào**:
+  + `drive_a`: mã SHA256 `636ba1a98dfc5ba665d1c935e1d2064e69f4df360ff9ffbd15795957d5e7e9aa`
+  + `drive_b`: mã SHA256 `bfa62703f645ff77a8578ae3fc74a00881140d38a404d43c8e2af265bbee9fdc`
+- **Phiên bản commit chính xác của các bảng Delta thượng nguồn**:
+  + `bronze.raw_telemetry_a`: commit version 0
+  + `bronze.raw_telemetry_b`: commit version 0
+  + `bronze.trips_raw`: commit version 0
+  + `bronze.video_files`: commit version 1
+  + `silver.frames`: commit version 27
+  + `silver.telemetry`: commit version 0
+  + `silver.frames_flagged`: commit version 0
+  + `silver.frame_telemetry`: commit version 0
+
+**2. Thông tin giúp tái tạo lại 100% đúng dataset này sau 3 tháng:**
+Để tái tạo lại chính xác tuyệt đối mà không sợ sai lệch, người thực hiện cần 3 thông tin:
+1. **Hai tệp video gốc** có đúng mã checksum SHA256 như trên.
+2. **Tính năng Time Travel của Delta Lake**: Sử dụng các số phiên bản commit trong lineage (ví dụ `VERSION AS OF 27` với `silver.frames` và `VERSION AS OF 0` với các bảng telemetry) để khôi phục snapshot dữ liệu tại đúng thời điểm tạo dataset.
+3. **Tham số cấu hình**: `LAB_STUDENT_ID=2A202602971` (để tái hiện đúng thứ tự phân chia split) và các quy tắc lọc chất lượng trong manifest (`drop: [is_black, is_blurry, is_near_dup, not sync_ok]`).
 
 ## Bước 5 · Điều phối và phục vụ
 
