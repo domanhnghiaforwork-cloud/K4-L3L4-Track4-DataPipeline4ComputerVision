@@ -4,10 +4,10 @@
 
 | | |
 |---|---|
-| Họ và tên | `<điền>` |
-| MSSV (đúng bằng `LAB_STUDENT_ID` trong `.env`) | `<điền>` |
-| GitHub | `<điền: tên tài khoản>` |
-| Trip dùng cho bài tập sập và chạy lại (xem GUIDE, bước 5) | `<điền: trip-xxxxx>` |
+| Họ và tên | Đỗ Mạnh Nghĩa |
+| MSSV (đúng bằng `LAB_STUDENT_ID` trong `.env`) | 2A202602971 |
+| GitHub | domanhnghiaforwork-cloud |
+| Trip dùng cho bài tập sập và chạy lại (xem GUIDE, bước 5) | trip-04868 |
 
 ## Kết quả cuối
 
@@ -21,7 +21,15 @@
 ### Câu 1
 Liệt kê **ít nhất 4 khác biệt** giữa telemetry nguồn A và nguồn B mà bạn thấy ở bronze. Vì sao pipeline giữ **mỗi nguồn một bảng bronze** và để mọi cột ở dạng chữ, thay vì gộp và ép kiểu ngay?
 
-(trả lời ở đây)
+Quan sát thực tế từ hai bảng thô `lake.bronze_raw_telemetry_a` (3021 dòng) và `lake.bronze_raw_telemetry_b` (3234 dòng), có các khác biệt cốt lõi sau:
+1. **Tên cột và cấu trúc schema (Schema drift)**: Nguồn A dùng `ts_utc`, `speed_mps`, `heading_deg`, `lat`, `lon`, `alt_m`, `gas`, `brake`, `steer`; trong khi nguồn B dùng tên khác hoàn toàn: `timestamp_ms`, `spd_kmh`, `hdg`, `latitude`, `longitude`, `altitude`, `throttle_pct`, `brake_pct`, `steering`.
+2. **Đơn vị vận tốc (Unit mismatch)**: Nguồn A đo bằng mét/giây (`speed_mps`), trong khi nguồn B đo bằng km/h (`spd_kmh`).
+3. **Định dạng timestamp**: Nguồn A dùng chuỗi ISO 8601 UTC dạng chuỗi (ví dụ: `2025-10-07T08:00:00.014Z`), còn nguồn B dùng số nguyên Unix epoch theo mili-giây (ví dụ: `1759933801509`).
+4. **Quy mô tín hiệu bàn đạp (Scale mismatch)**: Nguồn A chuẩn hóa giá trị từ `0.0 - 1.0` (`gas`, `brake`), còn nguồn B biểu diễn theo phần trăm `0 - 100` (`throttle_pct`, `brake_pct`).
+5. **Độ lệch đồng hồ thiết bị (Clock offset)**: Bảng `bronze_video_files` cho thấy thiết bị ghi telemetry B bị lệch đồng hồ 1500 ms (1.5 giây) so với video (`telemetry_clock_offset_ms = 1500`), còn nguồn A không lệch (offset = 0).
+
+**Lý do giữ mỗi nguồn một bảng Bronze và lưu kiểu chữ (string):**
+Theo kiến trúc Medallion (Slide 14), lớp Bronze là lớp lưu trữ nguyên bản (Raw Ingestion, Append-only) nhằm đảm bảo tính toàn vẹn và bất biến của dữ liệu gốc. Nếu gộp hoặc ép kiểu ngay tại Bronze, khi thiết bị gửi dữ liệu lỗi (chuỗi rác, null bất thường, schema drift), pipeline nạp sẽ gãy ngay lập tức và gây mất mát dữ liệu (data loss). Lưu ở dạng text giúp nhận 100% dữ liệu an toàn. Việc làm sạch, bù lệch thời gian, ép kiểu và cách ly bản ghi lỗi sẽ được dbt thực hiện ở lớp Silver. Lịch sử Delta Lake (`bronze.raw_telemetry_a`) cũng chứng minh tính idempotent: nạp 2 lần liên tiếp vẫn chỉ sinh đúng 1 commit version 0 nhờ kiểm tra sha256.
 
 ## Bước 2 · Silver telemetry
 
