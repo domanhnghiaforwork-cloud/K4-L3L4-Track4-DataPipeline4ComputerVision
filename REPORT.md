@@ -36,12 +36,46 @@ Theo kiến trúc Medallion (Slide 14), lớp Bronze là lớp lưu trữ nguyê
 ### Câu 2
 Pipeline đưa hai nguồn về một schema như thế nào (đơn vị, kiểu thời gian, **độ lệch đồng hồ**)? Bằng chứng nào trong kết quả bước 2 cho thấy đã đúng? Dán bảng quarantine của bạn (số dòng theo từng lý do, từng drive) và giải thích vì sao dòng lỗi vào `rejects` thay vì bị xoá.
 
-(trả lời ở đây)
+**Cách pipeline đưa hai nguồn về một schema thống nhất:**
+Dựa vào hai dbt staging model (`stg_telemetry_a.sql` và `stg_telemetry_b.sql`):
+1. **Đơn vị vận tốc**: Nguồn A giữ nguyên `speed_mps` (m/s). Nguồn B chia `spd_kmh / 3.6` để quy về cùng chuẩn m/s.
+2. **Kiểu thời gian**: Nguồn A parse chuỗi ISO thành `ts_utc::timestamptz`. Nguồn B đổi Unix millisecond thành timestamp bằng `epoch_ms`.
+3. **Bàn đạp ga/phanh**: Nguồn B chia cho 100.0 (`throttle_pct / 100.0`, `brake_pct / 100.0`) để cùng thang đo `[0, 1]` như A.
+4. **Bù độ lệch đồng hồ (Clock offset)**: File cấu hình `sources.json` khai báo nguồn B bị lệch đồng hồ 1500 ms. Staging của B trừ trực tiếp độ lệch này trước khi convert thời gian: `epoch_ms(timestamp_ms - 1500)`.
+
+**Bằng chứng cho thấy đã chuẩn hóa đúng:**
+- Thời điểm bắt đầu của telemetry B (`min(ts)`) sau khi trừ 1.5 giây là `2025-10-08 14:30:00.009000+00:00`, trùng khớp hoàn toàn với thời điểm bắt đầu video của drive B (`2025-10-08 14:30:00`). Test tự động module 2 xác nhận: `PASS: drive B clock offset removed (first sample within 0.5 s of video start)`.
+- Vận tốc tối đa sau khi quy đổi của cả 2 drive đều nằm trong giới hạn thực tế: drive A là 71 km/h (~19.7 m/s), drive B là 100 km/h (~27.8 m/s).
+
+**Bảng cách ly dữ liệu lỗi (Quarantine table) thực tế:**
+| drive_id | reject_reason | so_dong |
+|---|---|---|
+| drive_a | duplicate | 20 |
+| drive_a | speed_missing | 30 |
+| drive_a | speed_out_of_range | 3 |
+| drive_b | duplicate | 20 |
+| drive_b | speed_missing | 30 |
+| drive_b | speed_out_of_range | 3 |
+
+Tổng số dòng bị cách ly vào `silver.silver_telemetry_rejects` là 106 dòng (mỗi drive 53 dòng lỗi). Bảng sạch `silver.silver_telemetry` có 6149 dòng (drive A: 2968, drive B: 3181). Tổng `sạch + cách ly` bằng chính xác số dòng thô nhận vào: Drive A (2968 + 53 = 3021), Drive B (3181 + 53 = 3234).
+
+**Vì sao dòng lỗi vào `rejects` thay vì bị xoá:**
+Theo nguyên tắc Data Quality & Quarantine (Slide 29), việc xoá âm thầm (silent discard) là phản mẫu (anti-pattern) vì gây mất dấu vết kiểm toán (audit trail) và làm che giấu sự cố phần cứng. Đưa dòng lỗi vào bảng `rejects` kèm lý do cụ thể (`reject_reason`) vừa giữ bảng phân tích sạch sẽ, vừa cung cấp khả năng quan sát (Data Observability) để kỹ sư xe biết cảm biến nào đang chập chờn, mất tín hiệu hoặc sai lệch mà kịp thời bảo dưỡng.
 
 ### Câu 3
 Vì sao test `max_gap_ms` là `warn` còn `in_range` là `error`? Kết quả thí nghiệm `break-gate` của bạn (`break_gate.json`): test nào bắt được, bao nhiêu dòng, và điều đó cho biết gì về vai trò của "cổng chất lượng"?
 
-(trả lời ở đây)
+1. **Khác biệt giữa `max_gap_ms` (WARN) và `in_range` (ERROR)**:
+   - `max_gap_ms` được cấu hình `severity: warn` vì trong điều kiện vận hành thực tế của xe tự lái, cảm biến truyền dữ liệu qua mạng CAN bus / mạng không dây đôi lúc có hiện tượng rớt gói tín hiệu (sensor dropouts) làm khoảng cách giữa 2 mẫu > 1000 ms. Đây là khiếm khuyết vật lý được chấp nhận (tolerated defect); hệ thống cảnh báo để kỹ sư ghi nhận nhưng không dừng pipeline vì phần lớn dữ liệu còn lại vẫn có giá trị sử dụng.
+   - `in_range` (0..70 m/s) bắt buộc là `ERROR` vì nếu giá trị phi vật lý (như tốc độ 1000 m/s ~ 3600 km/h) lọt vào dataset huấn luyện, mô hình thị giác và điều khiển xe tự lái sẽ học sai nghiêm trọng, dẫn tới nguy cơ tai nạn chết người. Đây là lỗi vi phạm toàn vẹn dữ liệu chí mạng nên phải dừng pipeline ngay lập tức.
+
+2. **Kết quả thí nghiệm `break-gate` (`report/evidence/break_gate.json`)**:
+   - Khi nới luật làm sạch từ 70 m/s lên 1000 m/s, 6 giá trị tốc độ vô lý (3 dòng của A, 3 dòng của B) không bị cách ly nữa mà lọt thẳng vào bảng Silver.
+   - Cổng chất lượng dbt test đã lập tức bắt được lỗi: test `in_range_silver_telemetry_speed_mps__70__0` chuyển sang `FAIL` và bắt chính xác **6 dòng** vi phạm. Kết quả chạy test chuyển thành `PASS=5 WARN=1 ERROR=1 SKIP=0`.
+   - Sau khi khôi phục lại luật 70 m/s, dbt test quay về trạng thái đạt toàn bộ: `PASS=6 WARN=1 ERROR=0 SKIP=0`.
+
+3. **Vai trò của "Cổng chất lượng" (Quality Gate)**:
+   Cổng chất lượng đóng vai trò là "chốt chặn phòng thủ chiều sâu" (defense-in-depth). Ngay cả khi logic ETL/làm sạch bị cấu hình sai, bị nới lỏng hay gặp bug ngoài ý muốn, Quality Gate độc lập sẽ phát hiện vi phạm và chặn đứng pipeline, kiên quyết không cho dữ liệu "bẩn" lọt sang các tầng Gold hoặc kho dữ liệu phục vụ kinh doanh và AI.
 
 ## Bước 3 · Silver frames
 
