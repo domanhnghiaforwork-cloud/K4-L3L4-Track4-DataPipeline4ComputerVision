@@ -82,18 +82,33 @@ Vì sao test `max_gap_ms` là `warn` còn `in_range` là `error`? Kết quả th
 ### Câu 4
 Dựa vào `idempotency.json`: số dòng trước và sau hai lần chạy lại, và khi ghi kiểu `append`. Vì sao Delta `overwrite` theo partition (một trip) an toàn hơn xoá rồi ghi lại, nhất là khi giữa chừng có lỗi?
 
-(trả lời ở đây)
+**Số liệu thực tế từ thí nghiệm `report/evidence/idempotency.json`:**
+- **Trước khi chạy lại**: Bảng `silver.frames` có **1246 dòng**, dấu vân tay (fingerprint băm nội dung) là `6c7480dfde7e`.
+- **Sau 2 lần chạy lại partition (`trip-00003`, có 60 khung)**: Số dòng vẫn giữ nguyên chính xác **1246 dòng**, dấu vân tay vẫn là `6c7480dfde7e` -> Kết quả **KHÔNG ĐỔI (`unchanged: true`)**.
+- **Khi ghi kiểu sai (`append` 2 lần vào bảng thử `_scratch_append`)**: Trip có 60 khung ban đầu sau 2 lần chạy đã bị tích luỹ thành **120 dòng**, làm dữ liệu bị **NHÂN ĐÔI (2x)**!
+
+**Vì sao Delta `overwrite` theo partition an toàn hơn "Xoá rồi Ghi lại" (Delete-then-Insert):**
+1. **Tính nguyên tử ACID (Atomicity)**: Delta Lake sử dụng transaction log (`_delta_log`). Khi thực hiện `overwrite` có điều kiện partition (`replaceWhere="trip_id = '...'"`), các file dữ liệu mới được ghi vào object storage trước. Chỉ khi toàn bộ file mới ghi xong thành công, Delta mới commit 1 entry nguyên tử vào transaction log. Người đọc (reader) luôn nhìn thấy trạng thái nhất quán, không bao giờ thấy bảng bị trống hay dở dang.
+2. **Kháng lỗi sập giữa chừng (Crash resilience)**: Nếu dùng cơ chế truyền thống "Delete rồi Insert", đây là 2 thao tác rời rạc. Nếu lệnh insert bị chết giữa chừng (mất điện, OOM, đứt mạng), dữ liệu cũ đã bị xóa mất vĩnh viễn dẫn tới mất mát dữ liệu (data loss). Với Delta `overwrite`, nếu quá trình ghi bị sập giữa chừng, commit log không được tạo -> hệ thống tự động giữ nguyên phiên bản cũ nguyên vẹn 100%, bảo đảm an toàn tuyệt đối khi backfill hoặc retry task lỗi.
 
 ### Câu 5
 Khung hình **đen** và khung hình **tối** khác nhau thế nào, pipeline xử lý khác nhau ra sao, bạn có đồng ý không? Dựa vào `threshold.json`: nếu chọn ngưỡng 0, 2, 6 thì bao nhiêu khung bị coi là trùng ở mỗi drive? Bạn chọn ngưỡng nào, vì sao, và ngưỡng đó phụ thuộc vào tốc độ xe thế nào?
 
+1. **Khác biệt giữa khung hình ĐEN và khung hình TỐI**:
+   - **Khung đen (`is_black`)**: Độ sáng trung bình xấp xỉ 0 (do nắp camera chưa mở, mất nguồn cảm biến, lỗi phần cứng ghi hình). Khung này hoàn toàn vô giá trị và không có thông tin quang học -> Pipeline **loại bỏ** (không đưa vào tập Gold huấn luyện). Tôi hoàn toàn đồng ý vì đưa khung đen vào chỉ làm hỏng trọng số mô hình AI.
+   - **Khung tối (`toi_giu_lai` / `is_low_light`)**: Xe chạy vào đường hầm, dưới bóng râm rậm rạp hoặc ban đêm (kết quả bước 3 ghi nhận Drive B có tới 61 khung tối). Khung tối vẫn chứa thông tin thế giới thực (vệt sáng đèn xe, biển báo phản quang, vạch kẻ đường) -> Pipeline **gắn cờ cảnh báo nhưng giữ lại**. Tôi hoàn toàn đồng ý vì đây là các trường hợp biên (edge cases) vô cùng quý giá để mô hình AI học cách lái xe an toàn trong điều kiện thiếu sáng.
+
+2. **Bảng số khung trùng thực tế theo ngưỡng dHash (`report/evidence/threshold.json`)**:
+
 | dHash khác tối đa | số khung trùng, drive A | số khung trùng, drive B |
 |---|---|---|
-| 0 | | |
-| 2 | | |
-| 6 | | |
+| 0 | 61 | 8 |
+| 2 | 149 | 53 |
+| 6 | 363 | 244 |
 
-(trả lời ở đây)
+3. **Lựa chọn ngưỡng và sự phụ thuộc vào tốc độ xe**:
+   - **Chọn ngưỡng 2**: Ngưỡng 0 quá khắt khe (chỉ bắt khung giống hệt từng bit, bỏ sót khung trùng do rung lắc nhẹ hoặc nhiễu nén video); ngưỡng 6 quá lỏng (loại tới 363/602 khung của A và 244/644 khung của B, làm mất nhiều cảnh thực tế đã di chuyển). Ngưỡng 2 cân bằng hoàn hảo, phát hiện chính xác đoạn camera đứng hình 6 giây ở Drive A (149 khung trùng) và lọc bớt khung lặp khi xe dừng.
+   - **Phụ thuộc vào tốc độ xe**: Khi xe chạy chậm hoặc dừng chờ đèn đỏ, sự biến đổi cảnh vật giữa 2 khung hình liên tiếp (lấy mẫu 2 fps) là cực kỳ nhỏ, khoảng cách Hamming giữa hai mã dHash <= 2 -> bị gắn cờ trùng. Khi xe chạy tốc độ cao (như Drive B đạt 100 km/h trên cao tốc), cảnh vật thay đổi liên tục và mã dHash thay đổi rất nhiều bit -> số lượng khung trùng giảm rõ rệt (ngưỡng 2 ở Drive B chỉ có 53 khung so với 149 khung ở Drive A).
 
 ## Bước 4 · Gold
 
