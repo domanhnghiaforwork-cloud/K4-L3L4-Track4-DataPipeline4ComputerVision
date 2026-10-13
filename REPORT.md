@@ -162,21 +162,88 @@ Dataset này được tổng hợp từ:
 ### Câu 9
 Mô tả chính xác điều xảy ra khi trip của bạn sập rồi chạy lại: bao nhiêu task chuyển đỏ, bao nhiêu task `upstream_failed`, bạn clear gì, dữ liệu có nhân đôi không, `dataset_version` có đổi không? Bằng chứng (ảnh, số) là gì?
 
-(trả lời ở đây)
+1. **Kịch bản sập mô phỏng (`LAB_FAIL_ONCE`)**:
+   - Dựa trên MSSV `2A202602971`, chỉ số trip gặp sự cố là trip thứ 14 (map_index 13: `trip-04868` thuộc `drive_b`).
+   - Pipeline được kích hoạt chạy với biến môi trường `LAB_FAIL_ONCE=trip-04868`.
+
+2. **Các task bị ảnh hưởng**:
+   - **Số task chuyển ĐỎ (FAILED)**: Chính xác **1 task duy nhất** chuyển đỏ là dynamic mapped task `silver_frames` tại map_index 13 (`trip-04868`). Log của task ghi nhận ngoại lệ mô phỏng:
+     `RuntimeError: simulated crash while extracting trip-04868; run it again`
+   - **Số task bị UPSTREAM_FAILED (vàng/cam)**: Toàn bộ **7 task hạ nguồn** phụ thuộc trực tiếp và gián tiếp vào `silver_frames` đều không được thực thi và chuyển sang trạng thái `upstream_failed`:
+     1. `dbt_run_silver`
+     2. `dbt_test_silver`
+     3. `dbt_run_gold`
+     4. `dbt_test_gold`
+     5. `publish_lake`
+     6. `export_dataset`
+     7. `publish_warehouse`
+   - Các mapped tasks còn lại của `silver_frames` (map_index từ 0 đến 12 và từ 14 đến 25) cùng các task thượng nguồn (`start`, `fetch_video`, `fetch_telemetry`, `silver_telemetry`) vẫn thực thi thành công sang màu xanh (`success`).
+
+3. **Thao tác clear và phục hồi**:
+   - Sau khi xoá biến môi trường gây lỗi `LAB_FAIL_ONCE`, thực hiện lệnh clear trên Airflow CLI với cờ hạ nguồn `-d`:
+     `airflow tasks clear day09_video_pipeline -t silver_frames -d -e 2026-03-01T00:00:00+00:00`
+   - Airflow tự động lập lịch chạy lại duy nhất map_index 13 của task `silver_frames` và sau đó kích hoạt tuần tự toàn bộ 7 task hạ nguồn. Tất cả các task chuyển trạng thái sang xanh hoàn toàn (`success`).
+
+4. **Kiểm tra tính toàn vẹn dữ liệu và version**:
+   - **Dữ liệu có bị nhân đôi không**: **HOÀN TOÀN KHÔNG**. Cơ chế Delta Lake `overwrite` theo partition (`replaceWhere="trip_id = 'trip-04868'"`) đã xoá sạch trạng thái dở dang và ghi đè an toàn phân vùng `trip-04868` (48 khung). Tổng số khung hình của bảng `silver.frames` vẫn giữ nguyên chính xác **1246 dòng**, không hề bị tăng lên.
+   - **`dataset_version` có đổi không**: **KHÔNG ĐỔI**. Mã băm phiên bản dataset trước và sau khi phục hồi sự cố vẫn là **`ce01decd323e`**. Kiểm tra `verify` toàn bộ hệ thống vẫn đạt **27/27 checks passed**.
+   - **Bằng chứng**:
+     + Ảnh chụp màn hình task đỏ và log lỗi: `report/screenshots/airflow_crash.png`.
+     + Ảnh chụp đồ thị DAG hoàn thành xanh toàn bộ: `report/screenshots/airflow_graph.png`.
+     + Kết quả kiểm định tự động: `report/verify.txt` (27/27 checks passed).
 
 ### Câu 10
 Nâng từ 2 drive lên **500 xe mỗi ngày**: ba thành phần nào của pipeline này sẽ vỡ đầu tiên, và bạn thay bằng gì (nối với slide 12, 22, 23)?
 
-(trả lời ở đây)
+1. **Thành phần vỡ 1: Giải mã video (Video decode & frame extraction) trên 1 node đơn lẻ**
+   - *Hiện trạng*: Task `silver_frames` gọi FFmpeg giải mã trực tiếp trên worker container Airflow và đọc/ghi file tạm cục bộ trên ổ đĩa.
+   - *Khi lên 500 xe/ngày* (~15.000 - 30.000 video/ngày, hàng chục Terabytes dữ liệu thô): CPU, Disk I/O và băng thông của một worker đơn lẻ sẽ nghẽn hoàn toàn, tràn ổ đĩa và OOM.
+   - *Giải pháp thay thế (Slide 12)*: Tách việc giải mã video sang cụm tính toán phân tán (Distributed Compute Engine) như **Ray** hoặc **Apache Spark** trên Kubernetes, hoặc serverless worker pool (AWS Batch/Lambda với GPU/Hardware-accelerated decode như NVIDIA NVDEC / DALI). Video được stream trực tiếp từ Object Storage xuống worker theo batch mà không lưu đệm trung gian trên máy chủ Airflow.
+
+2. **Thành phần vỡ 2: DuckDB / Postgres Warehouse đơn node cho tầng Serving**
+   - *Hiện trạng*: dbt chạy biến đổi trực tiếp bằng DuckDB local file (`work/warehouse.duckdb`) rồi đẩy vào PostgreSQL đơn lẻ (`postgres:16-alpine`).
+   - *Khi lên 500 xe/ngày*: Lượng bản ghi telemetry và frames lên tới hàng chục triệu dòng mỗi ngày. Postgres sẽ chịu áp lực write/read phân tích quá tải, DuckDB đơn luồng bộ nhớ không đủ RAM để aggregate toàn bộ lịch sử.
+   - *Giải pháp thay thế (Slide 22)*: Thay thế Postgres/DuckDB bằng **Modern Cloud Data Lakehouse / Distributed Analytical Warehouse** như **Snowflake, Databricks (Delta Lake + Photon Engine), Google BigQuery, hoặc Trino/StarRocks** kết hợp với Apache Iceberg/Delta Lake trên Cloud Object Storage (S3 / GCS). Sử dụng cơ chế partition và liquid clustering theo `date / drive_id / vehicle_id` để tăng tốc truy vấn phân tích.
+
+3. **Thành phần vỡ 3: Kiến trúc điều phối Airflow LocalExecutor và Task Metadata DB**
+   - *Hiện trạng*: Airflow sử dụng LocalExecutor trên 1 máy ảo, toàn bộ task định tuyến trên 1 tiến trình và cơ sở dữ liệu metadata SQLite/Postgres local.
+   - *Khi lên 500 xe/ngày*: Dynamic task mapping sinh ra hàng chục nghìn mapped tasks mỗi ngày khiến Airflow scheduler bị tắc nghẽn hàng đợi (scheduler heartbeat starvation), cạn kiệt slot kết nối DB và thread worker.
+   - *Giải pháp thay thế (Slide 23)*: Nâng cấp kiến trúc điều phối lên **Airflow CeleryExecutor hoặc KubernetesExecutor** với nhiều Scheduler pods; hoặc chuyển sang các orchestrator hướng dữ liệu hiện đại cho scale lớn như **Temporal / Argo Workflows / Dagster**. Tích hợp Event-driven architecture (Kafka / AWS SQS / Kinesis) để trigger pipeline ngay khi xe vừa upload dữ liệu lên bucket thay vì chạy batch polling nặng nề.
 
 ## Câu hỏi riêng của bạn trên Metabase
 
 Câu SQL bạn thêm vào dashboard và điều nó cho biết:
 
-(trả lời ở đây)
+```sql
+-- Phân tích tỷ lệ loại bỏ khung hình theo từng hành trình (Rejection Rate per Drive)
+SELECT 
+    drive_id,
+    SUM(dropped_black) AS dropped_black,
+    SUM(dropped_blurry) AS dropped_blurry,
+    SUM(dropped_near_dup) AS dropped_near_dup,
+    SUM(dropped_out_of_sync) AS dropped_out_of_sync,
+    SUM(dropped_black + dropped_blurry + dropped_near_dup + dropped_out_of_sync) AS total_dropped,
+    ROUND(
+        SUM(dropped_black + dropped_blurry + dropped_near_dup + dropped_out_of_sync)::numeric / 
+        NULLIF(SUM(dropped_black + dropped_blurry + dropped_near_dup + dropped_out_of_sync) + 
+               (SELECT SUM(frames_kept) FROM marts.mart_trip_summary ts WHERE ts.drive_id = ff.drive_id), 0) * 100, 2
+    ) AS drop_percentage
+FROM marts.mart_frame_funnel ff
+GROUP BY drive_id
+ORDER BY drive_id;
+```
+
+**Ý nghĩa và phát hiện từ dữ liệu:**
+Truy vấn phân tích mức độ suy giảm chất lượng dữ liệu ở hai kịch bản lái xe khác nhau:
+- `drive_a` (nội thành/tốc độ thấp) có tỷ lệ loại bỏ cao hơn đáng kể (chủ yếu do dừng đèn đỏ gây trùng lặp dHash `dropped_near_dup = 149` và đoạn đứng hình camera).
+- `drive_b` (cao tốc/tốc độ cao) có tỷ lệ khung được giữ lại cao hơn (ít trùng lặp), nhưng lại có số khung bị loại do mất đồng bộ cảm biến `dropped_out_of_sync` và mờ chuyển động `dropped_blurry` cao hơn do xe di chuyển nhanh và rung lắc quang học. Giúp đội ngũ Computer Vision cân chỉnh lại tốc độ lấy mẫu và cảm biến theo từng điều kiện môi trường.
 
 ## Nhìn lại
 
 Điều bạn thấy bất ngờ nhất, điều gì còn chưa rõ, và một lỗi dữ liệu mà bạn nghĩ pipeline **chưa** bắt được (nếu có). Tối đa 8 dòng.
 
-(trả lời ở đây)
+- Bất ngờ nhất: Việc chia tập dữ liệu theo khung hình (per-frame) gây rò rỉ dữ liệu 100% (26/26 trip), cho thấy điểm kiểm thử CV cao chót vót có thể chỉ là ảo tưởng do phụ thuộc chuỗi thời gian.
+- Bất ngờ thứ hai: Sức mạnh của Delta Lake ACID log – một task bị crash giữa chừng có thể retry lại an toàn mà không sinh rác hay làm bẩn phiên bản dataset.
+- Điều còn chưa rõ: Cơ chế tối ưu ngưỡng dHash động theo vận tốc xe thực tế (tốc độ cao thì nới lỏng khoảng cách Hamming, dừng đèn đỏ thì siết chặt) để tránh loại oan các khung hình dừng chờ có người đi bộ băng qua đường.
+- Lỗi dữ liệu pipeline chưa bắt được: Giọt nước mưa hoặc vết bẩn bám cố định trên ống kính camera (occlusion / lens glare) – khung hình không đen, không mờ, không trùng dHash toàn cảnh nhưng che khuất một phần biển báo giao thông quan trọng.
+
